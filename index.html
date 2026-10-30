@@ -546,7 +546,7 @@ const Leaderboard = (() => {
     try { const a = JSON.parse(ls.get(KEY, '[]')); return Array.isArray(a) ? a.filter(e => e && typeof e.name === 'string' && typeof e.score === 'number') : []; } catch (e) { return []; }
   }
   function writeLocal(a) { ls.set(KEY, JSON.stringify(a)); }
-  function sortTop(a) { return a.sort((x, y) => y.score - x.score || x.ts - y.ts).slice(0, 10); }
+  function sortTop(a) { return a.sort((x, y) => y.score - x.score || x.ts - y.ts).slice(0, 15); }
   async function submitScore(name, score) {
     const entry = { id: Date.now() + '-' + Math.floor(Math.random() * 1e6), name: (cleanName(name).trim() || 'ANONYM').slice(0, 16), score: clamp(score | 0, 0, 100000), date: fmtDate(new Date()), ts: Date.now(), online: false };
     const list = sortTop(readLocal().concat([entry]));
@@ -566,7 +566,7 @@ const Leaderboard = (() => {
   async function fetchTop() {
     if (online()) {
       try {
-        const res = await fetch(LEADERBOARD_URL.replace(/\/$/, '') + '/rest/v1/' + LEADERBOARD_TABLE + '?select=name,score,created_at&order=score.desc,created_at.asc&limit=10', {
+        const res = await fetch(LEADERBOARD_URL.replace(/\/$/, '') + '/rest/v1/' + LEADERBOARD_TABLE + '?select=name,score,created_at&order=score.desc,created_at.asc&limit=15', {
           headers: { apikey: LEADERBOARD_KEY, Authorization: 'Bearer ' + LEADERBOARD_KEY }
         });
         if (res.ok) {
@@ -596,6 +596,9 @@ let score = 0, best = parseInt(ls.get('rff_best', '0'), 10) || 0;
 let levelIdx = 0, prevLevel = -1, fade = 1, banner = null, pairs = [], parts = [];
 let dist = 0, speed = 2.1, frame = 0, shake = 0, overT = 0, killer = '', newBest = false, demoT = 0, lastCompany = -1;
 let fadeA = 1;
+const GRACE = 30;          // 0,5 s Schwebephase nach dem Start
+const OVER_LOCK = 36;      // 0,6 s Sperre nach Game Over
+let grace = 0, gravRamp = 1, liftFromY = 0, inputLockUntil = 0;
 
 const levelOf = i => LEVELS[mod(i, LEVELS.length)];
 function difficulty() {
@@ -611,7 +614,10 @@ function groundTopAt(sx) { const L = levelOf(levelIdx); return H - L.near.SH + L
 function showBanner() { banner = { t: 0, idx: levelIdx }; }
 function startGame() {
   score = START_SCORE; pairs = []; parts = []; killer = ''; newBest = false; lastEntryId = null; lastEntry = null;
-  ship.vy = 0; ship.ang = 0;
+  // Immer sauber in der Mitte und ohne Restgeschwindigkeit starten
+  liftFromY = (state === 'start') ? ship.y : H * 0.42;
+  ship.y = liftFromY; ship.vy = 0; ship.ang = 0; ship.thrust = 0;
+  grace = GRACE; gravRamp = 0;
   const li = Math.floor(score / 10);
   if (li !== levelIdx) { prevLevel = levelIdx; levelIdx = li; fade = 0; }
   showBanner();
@@ -642,9 +648,12 @@ function sparks(n) {
 function flap() {
   ensureAudio();
   if (state === 'name') return;
-  if (state === 'start') startGame();
-  else if (state === 'over') { if (overT < 35) return; startGame(); }
+  const now = performance.now();
+  if (now < inputLockUntil) return;
+  if (state === 'start') { startGame(); inputLockUntil = now + 120; return; }      // erster Tipp startet nur
+  if (state === 'over') { if (overT < OVER_LOCK) return; startGame(); inputLockUntil = now + 120; return; }
   if (state !== 'play') return;
+  if (grace > 0) { if (GRACE - grace < 10) return; grace = 0; ship.y = Math.min(ship.y, H * 0.5); }
   ship.vy = FLAP; ship.thrust = 10; sfx.thrust();
   puff(); puff(); sparks(8);
 }
@@ -701,7 +710,20 @@ function update() {
 
   const D = difficulty(); speed = D.speed;
   dist += speed;
-  ship.vy = Math.min(ship.vy + GRAV, 8.5);
+  if (grace > 0) {
+    // Schwebephase: sanft vom Startpunkt in die Mitte gleiten, keine Schwerkraft, keine Kollision
+    grace--;
+    const t = 1 - grace / GRACE, e = t * t * (3 - 2 * t);
+    ship.y = liftFromY + (H * 0.42 - liftFromY) * e + Math.sin(frame * 0.15) * 1.5;
+    ship.vy = 0; ship.ang += (-0.08 - ship.ang) * 0.2;
+    if (frame % 3 === 0) sparks(1);
+    if (frame % 4 === 0) puff();
+    for (const p of pairs) p.x -= speed;
+    if (!pairs.length) spawnPair(Math.max(W + 80, ship.x + 330));
+    return;
+  }
+  if (gravRamp < 1) gravRamp = Math.min(1, gravRamp + 1 / 20);
+  ship.vy = Math.min(ship.vy + GRAV * (0.35 + 0.65 * gravRamp), 8.5);
   ship.y += ship.vy;
   const ta = clamp(ship.vy * 0.05, -0.32, 0.45);
   ship.ang += (ta - ship.ang) * 0.22;
@@ -711,7 +733,7 @@ function update() {
   for (const p of pairs) { p.x -= speed; if (p.amp) p.cy = p.baseY + Math.sin(p.ph + frame * 0.03) * p.amp; }
   while (pairs.length && pairs[0].x < -TW - 20) pairs.shift();
   const lastX = pairs.length ? pairs[pairs.length - 1].x : -1e9;
-  if (!pairs.length) spawnPair(W + 80);
+  if (!pairs.length) spawnPair(Math.max(W + 80, ship.x + 330));
   else if (lastX < W + 20 - D.spacing) spawnPair(lastX + D.spacing);
 
   if (DEMO) {
@@ -730,8 +752,11 @@ function update() {
 
   const pts = [];
   for (const ox of [-26, -9, 9, 26]) for (const oy of [-7, 7]) pts.push(local(ox, oy));
+  // Decke: nicht tödlich, der Wagen wird oben einfach abgebremst
+  let minY = Infinity;
+  for (const [, py] of pts) minY = Math.min(minY, py - 7);
+  if (minY < 2) { const dy = 2 - minY; ship.y += dy; for (const q of pts) q[1] += dy; if (ship.vy < 0) ship.vy = 0; }
   for (const [px, py] of pts) {
-    if (py < 6) return crash('FUNKLOCH ÜBER DEN WOLKEN!');
     if (py + 7 > groundTopAt(px)) return crash('BRUCHLANDUNG ' + levelOf(levelIdx).short + '!');
   }
   for (const p of pairs) {
@@ -967,10 +992,10 @@ function drawStart() {
   drawText('BRING GLASFASER IN JEDES DORF!', W / 2, 146, 1, '#ff9ad0', 'center');
   drawText('LEERTASTE / KLICK / TIPPEN ZUM HÜPFEN', W / 2, 158, 1, '#ffffff', 'center');
   drawText('M = TON   P = PAUSE   N = NAME', W / 2, 170, 1, '#a3acb5', 'center');
-  panel(px, 194, pw, 120, '#a3acb5');
-  drawLeaderboard(px, 202, pw, 10);
-  if (blink) drawText('TIPPEN ZUM STARTEN', W / 2, 324, 2, '#ffffff', 'center', '#000');
-  drawNameButton(344);
+  panel(px, 194, pw, 160, '#a3acb5');
+  drawLeaderboard(px, 202, pw, 15);
+  if (blink) drawText('TIPPEN ZUM STARTEN', W / 2, 362, 2, '#ffffff', 'center', '#000');
+  drawNameButton(380);
 }
 function drawNameScreen() {
   drawTitle(34);
@@ -997,8 +1022,8 @@ function drawOver() {
   drawText('ERREICHT: ' + levelOf(levelIdx).name, W / 2, py + 96, 1, levelOf(levelIdx).accent, 'center');
   if (newBest && Math.floor(frame / 15) % 2 === 0) drawText('NEUER REKORD!', W / 2, py + 108, 2, '#ffe066', 'center', '#5a0030');
   ctx.fillStyle = '#E20074'; ctx.fillRect(px + 10, py + 126, pw - 20, 1);
-  drawLeaderboard(px, py + 134, pw, 10);
-  if (overT > 35 && Math.floor(frame / 30) % 2 === 0) drawText('TIPPEN / LEERTASTE: NEUSTART', W / 2, py + ph + 10, 1, '#ffffff', 'center', '#000');
+  drawLeaderboard(px, py + 134, pw, 15);
+  if (overT >= OVER_LOCK && Math.floor(frame / 30) % 2 === 0) drawText('TIPPEN / LEERTASTE: NEUSTART', W / 2, py + ph + 10, 1, '#ffffff', 'center', '#000');
   drawNameButton(py + ph + 24);
 }
 function drawPause() {
@@ -1057,6 +1082,7 @@ function confirmName() {
   try { nameInput.blur(); } catch (e) {}
   ensureAudio(); sfx.hello();
   state = 'start';
+  inputLockUntil = performance.now() + 350;
   refreshTop();
   setTimeout(resize, 300);
 }
@@ -1071,17 +1097,23 @@ function toGame(e) {
   return { x: ((e.clientX - r.left) * dpr - offX) / dispScale, y: ((e.clientY - r.top) * dpr - offY) / dispScale };
 }
 const inBtn = (p, b) => b && p.x >= b.x - 3 && p.x <= b.x + b.w + 3 && p.y >= b.y - 3 && p.y <= b.y + b.h + 3;
+let lastTapT = -1e9, lastTapId = -1;
 screen.addEventListener('pointerdown', e => {
   e.preventDefault();
+  // doppelte/synthetische Events (Touch + Maus-Emulation, Geister-Taps) ignorieren
+  if (!e.isPrimary && e.pointerType === 'touch' && e.pointerId === lastTapId) return;
+  if (e.timeStamp - lastTapT < 70) return;
+  lastTapT = e.timeStamp; lastTapId = e.pointerId;
   const p = toGame(e);
   if (inBtn(p, muteBtn())) { toggleMute(); return; }
   if (state === 'name') { try { nameInput.focus(); } catch (err) {} return; }
-  if ((state === 'start' || (state === 'over' && overT > 24)) && inBtn(p, nameBtn)) { sfx.click(); openNameEntry(); return; }
+  if ((state === 'start' || (state === 'over' && overT >= OVER_LOCK)) && inBtn(p, nameBtn)) { sfx.click(); openNameEntry(); return; }
   if ((state === 'play' || state === 'paused') && inBtn(p, pauseBtn())) { ensureAudio(); togglePause(); return; }
   if (state === 'paused') { togglePause(); return; }
   flap();
 }, { passive: false });
-screen.addEventListener('touchstart', e => e.preventDefault(), { passive: false });
+screen.addEventListener('touchstart', e => e.preventDefault(), { passive: false });   // verhindert emulierte mousedown/click
+screen.addEventListener('touchend', e => e.preventDefault(), { passive: false });
 screen.addEventListener('contextmenu', e => e.preventDefault());
 window.addEventListener('keydown', e => {
   if (state === 'name' || e.target === nameInput) return;
@@ -1095,7 +1127,7 @@ window.addEventListener('keydown', e => {
   else if (k === 'KeyN') { if (state === 'start' || state === 'over') { e.preventDefault(); openNameEntry(); } }
   else if (k === 'KeyP' || k === 'Escape') { if (state === 'play' || state === 'paused') togglePause(); }
 });
-document.addEventListener('visibilitychange', () => { if (document.hidden && state === 'play') state = 'paused'; });
+document.addEventListener('visibilitychange', () => { if (document.hidden && state === 'play') state = 'paused'; last = performance.now(); acc = 0; });
 window.addEventListener('resize', resize);
 window.addEventListener('orientationchange', () => setTimeout(resize, 200));
 
@@ -1110,16 +1142,17 @@ let last = performance.now(), acc = 0;
 const STEP = 1000 / 60;
 function loop(now) {
   let dt = now - last; last = now;
-  if (dt > 250) dt = 250;
+  if (dt > 1000 / 30) dt = 1000 / 30;   // max. 1/30 s pro Frame (kein Sprung nach Tab-Wechsel/Pause)
+  if (dt < 0) dt = 0;
   acc += dt;
   let n = 0;
-  while (acc >= STEP && n < 6) { update(); acc -= STEP; n++; }
-  if (n === 6) acc = 0;
+  while (acc >= STEP && n < 3) { update(); acc -= STEP; n++; }
+  if (n === 3) acc = 0;
   render();
   requestAnimationFrame(loop);
 }
 requestAnimationFrame(loop);
-window.__rff = { get state() { return state; }, get score() { return score; }, get level() { return levelOf(levelIdx).name; }, get name() { return playerName; }, get top() { return topList; }, flap };
+window.__rff = { get state() { return state; }, get score() { return score; }, get level() { return levelOf(levelIdx).name; }, get name() { return playerName; }, get ship() { return { y: ship.y, vy: ship.vy }; }, get grace() { return grace; }, get overT() { return overT; }, get killer() { return killer; }, get top() { return topList; }, flap };
 })();
 </script>
 </body>
